@@ -58,6 +58,22 @@ static bool initSensor(uint8_t ch) {
     return true;
 }
 
+// ── Bulb helpers ──────────────────────────────────────────────────────────────
+static void enableAllBulbs() {
+    for (uint8_t s = 0; s < NUM_SENSORS; s++) {
+        tcaSelect(s);
+        sensor.enableBulb();
+        tcaDeselect();
+    }
+}
+static void disableAllBulbs() {
+    for (uint8_t s = 0; s < NUM_SENSORS; s++) {
+        tcaSelect(s);
+        sensor.disableBulb();
+        tcaDeselect();
+    }
+}
+
 // ── Acquire → Stage1 → Stage2 ─────────────────────────────────────────────────
 static bool acquireNorm(uint8_t s, float normOut[NUM_CHANNELS]) {
     long  sum[NUM_CHANNELS] = {};
@@ -89,6 +105,72 @@ static bool acquireNorm(uint8_t s, float normOut[NUM_CHANNELS]) {
     for (int c = 0; c < NUM_CHANNELS; c++)
         normOut[c] = (total > 0) ? cal[c] / total : 0;
     return true;
+}
+
+// ── Real-time single-shot read (raw values, bulb on during read) ──────────────
+static bool acquireRaw(uint8_t s, int rawOut[NUM_CHANNELS]) {
+    if (!tcaSelect(s)) return false;
+    sensor.enableBulb();
+    bool ok = (sensor.takeMeasurements() == 0);
+    if (ok) {
+        rawOut[0] = sensor.getViolet();
+        rawOut[1] = sensor.getBlue();
+        rawOut[2] = sensor.getGreen();
+        rawOut[3] = sensor.getYellow();
+        rawOut[4] = sensor.getOrange();
+        rawOut[5] = sensor.getRed();
+    }
+    sensor.disableBulb();
+    tcaDeselect();
+    return ok;
+}
+
+// ── Fast 1-sample calibrated+normalized read ──────────────────────────────────
+static bool acquireNormFast(uint8_t s, float normOut[NUM_CHANNELS]) {
+    int raw[NUM_CHANNELS] = {};
+    if (!acquireRaw(s, raw)) return false;
+    float cal[NUM_CHANNELS], total = 0;
+    for (int c = 0; c < NUM_CHANNELS; c++) {
+        cal[c] = CAL_GAIN[s][c] * raw[c] + CAL_BIAS[s][c];
+        if (cal[c] < 0) cal[c] = 0;
+        total += cal[c];
+    }
+    for (int c = 0; c < NUM_CHANNELS; c++)
+        normOut[c] = (total > 0) ? cal[c] / total : 0;
+    return true;
+}
+
+// ── Simultaneous: all bulbs stay on, read each sensor via TCA ────────────────
+static bool acquireAllSimultaneous(float normOut[NUM_SENSORS][NUM_CHANNELS], bool okOut[NUM_SENSORS]) {
+    int raw[NUM_SENSORS][NUM_CHANNELS] = {};
+    for (uint8_t s = 0; s < NUM_SENSORS; s++) {
+        okOut[s] = false;
+        if (!tcaSelect(s)) { tcaDeselect(); continue; }
+        if (sensor.takeMeasurements() == 0) {
+            raw[s][0] = sensor.getViolet();
+            raw[s][1] = sensor.getBlue();
+            raw[s][2] = sensor.getGreen();
+            raw[s][3] = sensor.getYellow();
+            raw[s][4] = sensor.getOrange();
+            raw[s][5] = sensor.getRed();
+            okOut[s] = true;
+        }
+        tcaDeselect();
+    }
+    bool anyOk = false;
+    for (uint8_t s = 0; s < NUM_SENSORS; s++) {
+        if (!okOut[s]) continue;
+        anyOk = true;
+        float cal[NUM_CHANNELS], total = 0;
+        for (int c = 0; c < NUM_CHANNELS; c++) {
+            cal[c] = CAL_GAIN[s][c] * raw[s][c] + CAL_BIAS[s][c];
+            if (cal[c] < 0) cal[c] = 0;
+            total += cal[c];
+        }
+        for (int c = 0; c < NUM_CHANNELS; c++)
+            normOut[s][c] = (total > 0) ? cal[c] / total : 0;
+    }
+    return anyOk;
 }
 
 // ── Measure all sensors, print normalized comparison ─────────────────────────
@@ -132,12 +214,7 @@ void setup() {
     Serial.begin(115200);
     delay(500);
     Serial.println("\n========================================");
-    Serial.println(" MilkScan — Normalized Spectral Output ");
-    Serial.println("========================================");
-    Serial.println("  Stage1: cal = gain*raw + bias");
-    Serial.println("  Stage2: norm = cal / sum(cal)");
-    Serial.println("  Output: normalized fraction per channel");
-    Serial.println("  Fill ALL 3 tubes with same sample.");
+    Serial.println(" MilkScan — Real-Time Channel Monitor  ");
     Serial.println("========================================\n");
 
     Wire.begin(21, 22);
@@ -150,25 +227,35 @@ void setup() {
         tcaDeselect();
     }
     if (!allOK) { Serial.println("FATAL: sensor init failed."); while(1); }
-    Serial.println("[INIT] All sensors OK\n");
-
-    const char* series[] = {
-        "BLUE","LIGHT-BLUE","PURPLE","PINK","LIGHT-PINK","WHITE"
-    };
-    for (int i = 0; i < 6; i++) {
-        Serial.printf("Fill ALL 3 tubes with %s.\n", series[i]);
-        Serial.print("Press ENTER when ready... ");
-        waitEnter();
-        delay(500);
-        measureAll(series[i]);
-    }
-
-    Serial.println("\n========================================");
-    Serial.println(" DONE                                  ");
-    Serial.println("========================================");
-    Serial.println("Normalized values sum to 1.000 per sensor.");
-    Serial.println("CV < 1% = sensors agree on spectral shape.");
-    Serial.println("Reset to run again.");
+    Serial.println("[INIT] All sensors OK");
+    enableAllBulbs();
+    Serial.println("[INIT] All bulbs ON (stay on)");
+    Serial.println("[INFO] Reading all channels in real-time...\n");
+    Serial.printf("  %-4s  %-7s  %6s  %6s  %6s  %6s  %6s  %6s\n",
+                  "Sens", "Ch", "V450", "B500", "G550", "Y570", "O600", "R650");
+    Serial.println("  -------------------------------------------------------");
 }
 
-void loop() { delay(1000); }
+// ── Loop: all 3 bulbs on simultaneously, read each sensor via TCA ─────────────
+void loop() {
+    static uint32_t iter = 0;
+    iter++;
+    Serial.printf("--- #%lu ---\n", iter);
+    Serial.printf("  %-4s  %8s  %8s  %8s  %8s  %8s  %8s\n",
+                  "Sens", "V(450)", "B(500)", "G(550)", "Y(570)", "O(600)", "R(650)");
+
+    float norm[NUM_SENSORS][NUM_CHANNELS] = {};
+    bool  ok[NUM_SENSORS] = {};
+    acquireAllSimultaneous(norm, ok);
+
+    for (uint8_t s = 0; s < NUM_SENSORS; s++) {
+        if (ok[s]) {
+            Serial.printf("  S%-3d  %8.4f  %8.4f  %8.4f  %8.4f  %8.4f  %8.4f\n",
+                          s, norm[s][0], norm[s][1], norm[s][2],
+                             norm[s][3], norm[s][4], norm[s][5]);
+        } else {
+            Serial.printf("  S%-3d  FAIL\n", s);
+        }
+    }
+    Serial.println();
+}
